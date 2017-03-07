@@ -1,0 +1,9 @@
+cluster:
+    host: db0erf.de
+    port: 41113
+    user: ENTER*USER*NAME*HERE
+    pass: ENTER*PASSWORD*HERE
+dapnet:
+    api_url: http://hampager.de:8080
+    user: ENTER*USER*HERE
+    pass: ENTER*PASS*HERE
