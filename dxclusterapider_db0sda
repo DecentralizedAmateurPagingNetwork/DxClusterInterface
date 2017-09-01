@@ -1,0 +1,160 @@
+#!/usr/bin/perl
+#
+# Perl-Skript zum Transfer DX-Cluster -> DAPNET
+#
+# developed since 05/20/2017 by Michael DG5MM
+# rev: 0.3
+#
+# öffnet ein Telnet-Socket zum DX-Cluster DB0ERF (Erfurt), liest die eintrudelnden Spots ein,
+# sortiert/kategorisiert und leitet ggf. via REST-API ins DAPNET weiter.
+# Es werden nur Spots mit Ursprung in DL/ON/PA angenommen um die Anzahl einzuschränken
+# und weil dies die Interessantesten für die Zielgruppe sein drüften. Announcements und 
+# sonstiger Strunks werden via Filter beim Init direkt unterdrückt, sämtliche weitere Filterung
+# und Kategorisierung der Spots an sich wird hier clientseitig gemacht
+#
+#
+# required: 	libtelnet-perl, libswitch-perl, libexperimental-perl, libfile-nfslock-perl	(alle via Ubuntu-/Debian-Repositories)
+#		Bundle::CPAN, REST::Client							(via CPAN)
+
+use Net::Telnet;
+use Switch;
+use experimental 'smartmatch';
+use REST::Client;
+use MIME::Base64;
+use Fcntl qw(LOCK_EX LOCK_NB);
+use File::NFSLock;
+
+my $lock = File::NFSLock->new($0, LOCK_EX|LOCK_NB);
+die "DX-Cluster-Spider already running -> exit!" unless $lock;
+
+$host = 'db0erf.de';		# Hostname/IP-Adresse des DX-Cluster
+$port = '41113';		# Telnet-Port des DX-Cluster
+$user = '#fillin';		# Benutzername am DX-Cluster
+$passwd = '#fillin';		# Passwort am DX-Cluster
+$dapnethost = 'hampager.de';	# DAPNET-Server-Host
+$dapnetport = '8080';		# DAPNET-Server-Port
+$dapnetuser = '#fillin';	# Benutzername am DAPNET-Server
+$dapnetpw = '#fillin';		# Passwort am DAPNET-Server
+$debug = true;			# Debug-Modus oder silent?
+$linesread = 0;			# Anzahl der via Telnet-Socket eingelesenen Zeilen/Spots, zunächst mal keine :-)
+$spotspaged = 0;		# Anzahl der ins DAPNET insgesamt übertragenen Spots...
+$spotspagedkw = 0;		# ...sowie der Spots auf KW ungleich CW...
+$spotspagedkwcw = 0;		# ...CW-Spots auf KW...
+$spotspaged50 = 0;		# ...6m-Spots...
+$spotspagedvhfuhf = 0;		# ...2m/70cm-Spots...
+$spotspagedshf = 0;		# ...23cm und höher
+
+sub init {
+  $t = new Net::Telnet (Timeout=>45,Errmode=>'die');							# neues Telnet-Socket wird kreiert, 45 sek. Zeit zum Verbinden, bei Fehlern Programmabbruch
+  $t->open(Host=>$host,Port=>$port);
+  if($debug) { print "Verbindung zu $host:$port hergestellt.\n"; }
+  $t->waitfor('/login: ?$/i');										# es wird gewartet (z.B. auf einen eventuellen Willkommenstext) bis das Cluster den Login fordert...
+  $t->print($user);											# dann werden der Benutzername...
+  $t->waitfor('/password: ?$/i');									# sowie sobald angefordert...
+  $t->print($passwd);											# das Passwort geschickt
+  if($debug) { print "Credentials gesendet, Willkommenstext wird erwartet....\n"; }
+  $t->waitfor("/$user de?/i");										# warten bis der Prompt des Clusters da ist (beginnt mit "CALL de...") 
+  $t->print("acc/spot by DA,DB,DC,DD,DE,DF,DG,DH,DI,DJ,DK,DL,DM,DN,DO,DP,DQ,ON,OO,PA,PB,PC,PD,PE");	# Filterregeln setzen: Wir wollen nur Spots aus DL,ON,PA sehen
+  $t->waitfor("/$user de?/i");										# warten bis zum nächsten Prompt
+  $t->print("rej/ann all");										# Announcements interessieren uns nicht, rejecten wir also
+  $t->waitfor("/$user de?/i");										# warten bis zum nächsten Prompt 
+  $t->print("rej/wwv all");										# WWV auch nicht, auch reject :-)
+  $t->waitfor("/$user de?/i");										# alle Filter gesetzt und Prompt wieder da
+  $output = $t->getline();										# diese Zeile verwerfen wir noch, ab jetzt trudeln nur noch Spots Zeile für Zeile ein
+  if($debug) { print "Filter wurden gesetzt, Spots werden jetzt erwartet\n"; }  
+  $c = REST::Client->new();										# wir klöppeln uns einen neuen REST-Client
+  $c->setHost("$dapnethost:$dapnetport");								# zu diesem Server/Port
+  $c->addHeader('Authorization'=>'Basic ' . encode_base64($dapnetuser . ':' . $dapnetpw));		# mit diesen Credentials
+}
+
+sub zeile_verarbeiten {						# diese Routine bekommt aus dem Hauptprogramm jede einzelne empfangene Zeile zugeschustert
+  my $zeile = shift(@_);
+  my $paged = false;						# hier speichern wir zu Debug-Zwecken ab, ob der Spot ans DAPNET weitergegeben wurde oder nicht
+  $linesread++;							# wieder eine Zeile bearbeitet :-)
+  my $quellcall = substr $zeile, 6, 8;				# das Rufzeichen des Spottenden steht an definierter Stelle und wird extrahiert...
+  $quellcall =~ s/^\s+|\s+$//g;					# sowie eventuelle Leerzeichen vorne und hinten entfernt (entspricht trim();)
+  $quellcall = substr $quellcall,0,-1;				# die DX-Cluster-Software packt hier einen Doppelpunkt ans Ende des Spotter-Rufzeichens, weg damit
+  my $frequenz = substr $zeile, 15, 9;				# Frequenz der DX-Station wird extrahiert und getrimt();
+  $frequenz =~ s/^\s+|\s+$//g;
+  my $dxcall = substr $zeile, 26, 11;				# DX-Call extrahieren und trimmen();
+  $dxcall =~ s/^\s+|\s+$//g;
+  my $uhrzeit = substr $zeile, 70, 4;				# und zuletzt noch die Uhrzeit des Spots
+  $uhrzeit .= "z";						# mit nem kleinen z hintendran, ist ja UTC
+  my $nachricht = "$frequenz $dxcall";				# Nachricht zusammenbauen: zuerst Frequenz und DX-Call...
+  while (length($nachricht) < 20) {				# erste Zeile auffüllen bis 20 Zeichen lang (Skyper-Standard)
+    $nachricht .= ' ';
+  }
+  $nachricht .= "von $quellcall um $uhrzeit";			# dann noch Spotter und Uhrzeit rein
+
+  my $intfreq = int($frequenz);
+  my $rubricname = '';
+  switch ($intfreq) {						# Klassifizierung des Spots anhand seiner Frequenz und des IARU-R1-Bandplanes
+    case [ 1810..1838, 3500..3570, 5350..5354, 7000..7040, 10100..10130, 14000..14070, 18068..18095, 21000..21070, 24890..24915, 28000..28070 ]	{ 
+      my $pos = $spotspagedkwcw % 5 + 1;
+      $c->POST('/news', '{"rubricName": "dx-kwcw", "text": "'.$nachricht.'", "number": '.$pos.'}', {"Content-type"=>'application/json'});
+      $paged = true;
+      $spotspaged++;
+      $spotspagedkwcw++;
+      if($debug) { print "$linesread\t$spotspaged\t$spotspagedkwcw\tpaged=true\trubrik=dx-kwcw\tpos=".$pos."\tf=".$frequenz."\tquelle=".$quellcall."\tdxcall=".$dxcall."\tuhrzeit=".$uhrzeit."\n"; }	# Debug: jeder Spot wird ausgegeben, auch wenn er nix fürs DAPNET war :-)
+    }
+    case [ 1839..2000, 3571..3800, 5355..5367, 7041..7200, 10131..10150, 14071..14350, 18096..18168, 21071..21450, 24916..24990, 28071..29700 ]	{ 
+      my $pos = $spotspagedkw % 5 + 1;
+      $c->POST('/news', '{"rubricName": "dx-kw", "text": "'.$nachricht.'", "number": '.$pos.'}', {"Content-type"=>'application/json'});
+      $paged = true;
+      $spotspaged++;
+      $spotspagedkw++;
+      if($debug) { print "$linesread\t$spotspaged\t$spotspagedkw\tpaged=true\trubrik=dx-kw\tpos=".$pos."\tf=".$frequenz."\tquelle=".$quellcall."\tdxcall=".$dxcall."\tuhrzeit=".$uhrzeit."\n"; }
+    }
+    case [ 50000..72000 ] { 
+      my $pos = $spotspaged50 % 5 + 1;
+      $c->POST('/news', '{"rubricName": "dx-50mhz", "text": "'.$nachricht.'", "number": '.$pos.'}', {"Content-type"=>'application/json'});
+      $paged = true;
+      $spotspaged++;
+      $spotspaged50++;
+      if($debug) { print "$linesread\t$spotspaged\t$spotspaged50\tpaged=true\trubrik=dx-50mhz\tpos=".$pos."\tf=".$frequenz."\tquelle=".$quellcall."\tdxcall=".$dxcall."\tuhrzeit=".$uhrzeit."\n"; }
+    }
+    case [ 144000..146000, 430000..440000 ] { 
+      my $pos = $spotspagedvhfuhf % 5 + 1;
+      $c->POST('/news', '{"rubricName": "dx-vhf uhf", "text": "'.$nachricht.'", "number": '.$pos.'}', {"Content-type"=>'application/json'});
+      $paged = true;
+      $spotspaged++;
+      $spotspagedvhfuhf++;
+      if($debug) { print "$linesread\t$spotspaged\t$spotspagedvhfuhf\tpaged=true\trubrik=dx-vhf uhf\tpos=".$pos."\tf=".$frequenz."\tquelle=".$quellcall."\tdxcall=".$dxcall."\tuhrzeit=".$uhrzeit."\n"; }
+    }
+    case [ 1200000..1300000 ] {
+      my $pos = $spotspagedshf % 5 + 1;
+      $c->POST('/news', '{"rubricName": "dx shf", "text": "'.$nachricht.'", "number": '.$pos.'}', {"Content-type"=>'application/json'});
+      $paged = true;
+      $spotspaged++;
+      $spotspagedshf++;
+      if($debug) { print "$linesread\t$spotspaged\t$spotspagedshf\tpaged=true\trubrik=dx-vhf uhf\tpos=".$pos."\tf=".$frequenz."\tquelle=".$quellcall."\tdxcall=".$dxcall."\tuhrzeit=".$uhrzeit."\n"; }
+    }
+  }
+}
+
+
+sub statistik {							# alle 50 Spots wird hier ein neuer Statistikeintrag für die entsprechende Rubrik generiert
+  my $nachricht = "DXCluster bei DB0SDA";
+  $nachricht .= "ges:$spotspaged  KW:$spotspagedkw";  
+  while (length($nachricht) < 40) {				# zweite Zeile auffüllen bis 20 Zeichen lang (Skyper-Standard)
+    $nachricht .= ' ';
+  }
+  $nachricht .= "KWCW:$spotspagedkwcw 4/6m:$spotspaged50";
+  while (length($nachricht) < 60) {				# dritte Zeile auffüllen bis 20 Zeichen lang (Skyper-Standard)
+    $nachricht .= ' ';
+  }
+  $nachricht .= "V/UHF:$spotspagedvhfuhf  SHF:$spotspagedshf";
+  print "Stats: $nachricht\n";
+  $c->POST('/news', '{"rubricName": "stats", "text": "'.$nachricht.'", "number": 1 }', {"Content-type"=>'application/json'});
+
+}
+
+#Beginn des Hauptprogrammes
+init();								# Initialisierung, also Telnetsocket bauen, einloggen, etc.
+while (1) {							# ab dann trudeln sobald vorhanden die Spots und Announcements ein und werden in dieser Endlosschleife
+  $output = $t->getline(Timeout=>1800);				# Zeile für Zeile entgegengenommen und gezählt; wenn mehr als eine halbe Stunde lang nichts kommt -> Programmabbruch
+  zeile_verarbeiten($output);  
+  if (!($spotspaged % 50)) { 
+    statistik();
+  }
+}
