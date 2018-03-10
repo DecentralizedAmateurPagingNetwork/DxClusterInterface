@@ -3,7 +3,7 @@
 # Perl-Skript zum Transfer DX-Cluster -> DAPNET
 #
 # developed since 05/20/2017 by Michael DG5MM
-# rev: 0.3
+# rev: 0.4
 #
 # öffnet ein Telnet-Socket zum DX-Cluster DB0ERF (Erfurt), liest die eintrudelnden Spots ein,
 # sortiert/kategorisiert und leitet ggf. via REST-API ins DAPNET weiter.
@@ -54,7 +54,7 @@ sub init {
   $t->print($passwd);											# das Passwort geschickt
   if($debug) { print "Credentials gesendet, Willkommenstext wird erwartet....\n"; }
   $t->waitfor("/$user de?/i");										# warten bis der Prompt des Clusters da ist (beginnt mit "CALL de...") 
-  $t->print("acc/spot by DA,DB,DC,DD,DE,DF,DG,DH,DI,DJ,DK,DL,DM,DN,DO,DP,DQ,ON,OO,PA,PB,PC,PD,PE");	# Filterregeln setzen: Wir wollen nur Spots aus DL,ON,PA sehen
+  $t->print("acc/spot by DA,DB,DC,DD,DE,DF,DG,DH,DI,DJ,DK,DL,DM,DN,DO,DP,DQ,ON,OO,PA,PB,PC,PD,PE,LX,OH,HB,HB,OE,OK,SP");			# Filterregeln setzen: Wir wollen nur Spots aus DL und Anreinerstaaten sehen
   $t->waitfor("/$user de?/i");										# warten bis zum nächsten Prompt
   $t->print("rej/ann all");										# Announcements interessieren uns nicht, rejecten wir also
   $t->waitfor("/$user de?/i");										# warten bis zum nächsten Prompt 
